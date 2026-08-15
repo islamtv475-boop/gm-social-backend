@@ -1,0 +1,188 @@
+import os
+import re
+from typing import Any, Optional
+from urllib.parse import urlparse
+
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+app = FastAPI(
+    title="GM Social Downloader API",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "fe64982d69msh9912a3389f014cfp15b50bjsn7c1175c1ff2d")
+RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST", "auto-download-all-in-one-big.p.rapidapi.com")
+RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/v1/social/autolink"
+TIKWM_URL = "https://www.tikwm.com/api/"
+
+class ExtractRequest(BaseModel):
+    url: str = Field(..., min_length=8, max_length=2048)
+
+class MediaItem(BaseModel):
+    url: str
+    type: str = "video"
+
+class ExtractResponse(BaseModel):
+    success: bool
+    source: str
+    original_url: str
+    media: list[MediaItem] = []
+    title: Optional[str] = None
+    thumbnail: Optional[str] = None
+    message: Optional[str] = None
+
+URL_REGEX = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
+
+def validate_url(url: str) -> str:
+    url = url.strip()
+    if not URL_REGEX.match(url):
+        raise HTTPException(status_code=400, detail="Invalid URL format")
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Invalid URL host")
+    return url
+
+def detect_platform(url: str) -> str:
+    host = urlparse(url).netloc.lower().removeprefix("www.")
+    if "tiktok.com" in host:
+        return "tiktok"
+    if "instagram.com" in host:
+        return "instagram"
+    if "facebook.com" in host or host == "fb.watch":
+        return "facebook"
+    if "youtube.com" in host or "youtu.be" in host:
+        return "youtube"
+    return "unknown"
+
+def is_probable_media_url(url: str) -> bool:
+    if not isinstance(url, str) or not url.strip().startswith(("http://", "https://")):
+        return False
+    lowered = url.lower()
+    ignored = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", "avatar", "profile", "favicon", "logo", "icon")
+    if any(x in lowered for x in ignored):
+        return False
+    indicators = (".mp4", ".m3u8", ".mov", ".webm", "video", "download", "media", "play", "stream", "googlevideo", "cdn")
+    return any(x in lowered for x in indicators)
+
+def media_score(key: str, url: str) -> int:
+    key = key.lower()
+    score = 0
+    strong_keys = {"download_url": 100, "video_url": 100, "video": 90, "play": 90, "play_url": 90, "download": 80, "media_url": 80, "media": 70, "url": 30}
+    score += strong_keys.get(key, 0)
+    lowered = url.lower()
+    if ".mp4" in lowered: score += 50
+    if ".m3u8" in lowered: score += 30
+    if "video" in lowered: score += 20
+    return score
+
+def find_media_urls(obj: Any, results: Optional[list[tuple[int, str]]] = None, parent_key: str = "") -> list[tuple[int, str]]:
+    if results is None: results = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            key_string = str(key)
+            if isinstance(value, str) and is_probable_media_url(value):
+                score = media_score(key_string, value)
+                results.append((score, value))
+            else:
+                find_media_urls(value, results, key_string)
+    elif isinstance(obj, list):
+        for item in obj:
+            find_media_urls(item, results, parent_key)
+    return results
+
+def get_best_media_urls(data: Any) -> list[str]:
+    candidates = find_media_urls(data)
+    unique = {}
+    for score, url in candidates:
+        unique[url] = max(score, unique.get(url, 0))
+    sorted_urls = sorted(unique.items(), key=lambda x: x[1], reverse=True)
+    return [url for url, score in sorted_urls[:10]]
+
+async def extract_tiktok(url: str) -> ExtractResponse:
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0), follow_redirects=True) as client:
+            response = await client.get(TIKWM_URL, params={"url": url})
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"TikTok connection error: {exc}")
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail="TikTok server error")
+
+    data = response.json()
+    if data.get("code") not in (0, "0"):
+        raise HTTPException(status_code=502, detail="TikTok extraction failed")
+
+    payload = data.get("data") or {}
+    video_url = payload.get("play") or payload.get("hdplay") or payload.get("wmplay")
+    
+    if video_url and not video_url.startswith("http"):
+        video_url = "https://www.tikwm.com" + video_url
+
+    if not video_url:
+        raise HTTPException(status_code=502, detail="No video URL found in TikTok response")
+
+    return ExtractResponse(
+        success=True,
+        source="tiktok",
+        original_url=url,
+        media=[MediaItem(url=video_url, type="video")],
+        title=payload.get("title"),
+        thumbnail=payload.get("cover")
+    )
+
+async def extract_rapidapi(url: str, platform: str) -> ExtractResponse:
+    headers = {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": RAPIDAPI_HOST,
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(25.0), follow_redirects=True) as client:
+            response = await client.post(RAPIDAPI_URL, headers=headers, json={"url": url})
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"RapidAPI connection error: {exc}")
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"RapidAPI HTTP {response.status_code}")
+
+    try:
+        data = response.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="Invalid JSON from RapidAPI")
+
+    media_urls = get_best_media_urls(data)
+    if not media_urls:
+        raise HTTPException(status_code=502, detail="Extraction failed for this URL")
+
+    return ExtractResponse(
+        success=True,
+        source=platform,
+        original_url=url,
+        media=[MediaItem(url=u, type="video") for u in media_urls],
+        message="Extraction successful"
+    )
+
+@app.get("/")
+async def root():
+    return {"status": "active", "service": "GM Social Downloader API"}
+
+@app.post("/extract", response_model=ExtractResponse)
+async def extract(request: ExtractRequest):
+    url = validate_url(request.url)
+    platform = detect_platform(url)
+    if platform == "unknown":
+        raise HTTPException(status_code=400, detail="Unsupported platform")
+    if platform == "tiktok":
+        return await extract_tiktok(url)
+    return await extract_rapidapi(url=url, platform=platform)
